@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Google Sans", Arial, sans-serif;
+      font-size: 13px;
+      margin: 0;
+      padding: 12px;
+      color: #202124;
+      background: #fff;
+    }
+    h3 { margin: 0 0 12px; font-size: 14px; }
+    label { display: block; margin-bottom: 4px; font-weight: 500; }
+    input[type="text"], input[type="url"] {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    button {
+      margin-top: 6px;
+      padding: 6px 14px;
+      background: #1a73e8;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    button:disabled { background: #aaa; cursor: default; }
+    .section { margin-bottom: 16px; }
+    .row { display: flex; align-items: center; gap: 8px; }
+    #blockSlider { flex: 1; }
+    #blockDisplay { width: 72px; text-align: right; font-variant-numeric: tabular-nums; }
+    #statusBar {
+      padding: 6px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      background: #f1f3f4;
+      margin-top: 8px;
+    }
+    #statusBar.live   { background: #e6f4ea; color: #137333; }
+    #statusBar.pinned { background: #fce8b2; color: #b06000; }
+    #statusBar.fetching { background: #e8f0fe; color: #1a73e8; }
+    #statusBar.error  { background: #fce8e6; color: #c5221f; }
+    .divider { border: none; border-top: 1px solid #e0e0e0; margin: 12px 0; }
+  </style>
+</head>
+<body>
+
+<h3>sheets-on-chain</h3>
+
+<!-- Backend URL -->
+<div class="section">
+  <label for="backendUrl">Backend URL</label>
+  <input type="url" id="backendUrl" placeholder="http://localhost:3000">
+  <button id="saveBtn">Save</button>
+</div>
+
+<hr class="divider">
+
+<!-- Block control -->
+<div class="section">
+  <label>Block</label>
+  <div class="row">
+    <input type="range" id="blockSlider" min="1" max="99999999" value="1" step="1">
+    <span id="blockDisplay">—</span>
+  </div>
+  <div class="row" style="margin-top:8px;">
+    <input type="checkbox" id="liveCheck" checked>
+    <label for="liveCheck" style="margin:0;font-weight:normal;">Latest (live)</label>
+  </div>
+</div>
+
+<div id="statusBar">Idle</div>
+
+<script>
+(function () {
+  // ── State ────────────────────────────────────────────────────────────────
+  var backendUrl = "";
+  var ws = null;          // WebSocket for newHeads
+  var currentBlock = 0;
+  var sliderDebounce = null;
+
+  // ── DOM refs ─────────────────────────────────────────────────────────────
+  var urlInput     = document.getElementById("backendUrl");
+  var saveBtn      = document.getElementById("saveBtn");
+  var blockSlider  = document.getElementById("blockSlider");
+  var blockDisplay = document.getElementById("blockDisplay");
+  var liveCheck    = document.getElementById("liveCheck");
+  var statusBar    = document.getElementById("statusBar");
+
+  // ── Init ─────────────────────────────────────────────────────────────────
+  google.script.run
+    .withSuccessHandler(function (cfg) {
+      backendUrl = cfg.backendUrl || "";
+      urlInput.value = backendUrl;
+      if (liveCheck.checked && backendUrl) {
+        connectWebSocket();
+      }
+    })
+    .getConfig();
+
+  // ── Save config ───────────────────────────────────────────────────────────
+  saveBtn.addEventListener("click", function () {
+    backendUrl = urlInput.value.trim();
+    google.script.run
+      .withSuccessHandler(function () {
+        setStatus("Saved", "");
+        if (liveCheck.checked && backendUrl) {
+          reconnectWebSocket();
+        }
+      })
+      .saveConfig(backendUrl);
+  });
+
+  // ── Live / pinned toggle ──────────────────────────────────────────────────
+  liveCheck.addEventListener("change", function () {
+    if (liveCheck.checked) {
+      blockSlider.disabled = true;
+      reconnectWebSocket();
+    } else {
+      blockSlider.disabled = false;
+      closeWebSocket();
+      setStatus("Pinned block " + currentBlock, "pinned");
+    }
+  });
+
+  // ── Block slider ──────────────────────────────────────────────────────────
+  blockSlider.disabled = true; // disabled while in live mode
+
+  blockSlider.addEventListener("input", function () {
+    currentBlock = parseInt(blockSlider.value, 10);
+    blockDisplay.textContent = currentBlock;
+    clearTimeout(sliderDebounce);
+    sliderDebounce = setTimeout(triggerBatchFetch, 300);
+  });
+
+  // ── WebSocket ─────────────────────────────────────────────────────────────
+  function reconnectWebSocket() {
+    closeWebSocket();
+    connectWebSocket();
+  }
+
+  function connectWebSocket() {
+    if (!backendUrl) {
+      setStatus("No backend URL set", "error");
+      return;
+    }
+    // Convert http(s) → ws(s)
+    var wsUrl = backendUrl.replace(/^http/, "ws");
+    setStatus("Connecting…", "fetching");
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (e) {
+      setStatus("WS connect failed: " + e.message, "error");
+      return;
+    }
+
+    ws.onopen = function () {
+      setStatus("Connected, subscribing…", "fetching");
+      ws.send(JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_subscribe",
+        params: ["newHeads"]
+      }));
+    };
+
+    ws.onmessage = function (evt) {
+      var msg;
+      try { msg = JSON.parse(evt.data); } catch (e) { return; }
+
+      // Subscription confirmation — trigger initial fetch
+      if (msg.id === 1 && msg.result) {
+        setStatus("Live — waiting for block…", "live");
+        triggerBatchFetch();
+        return;
+      }
+
+      // New block notification
+      if (
+        msg.method === "eth_subscription" &&
+        msg.params &&
+        msg.params.result &&
+        msg.params.result.number
+      ) {
+        var blockHex = msg.params.result.number;
+        currentBlock = parseInt(blockHex, 16);
+        updateSlider(currentBlock);
+        setStatus("Live — block " + currentBlock, "live");
+        triggerBatchFetch();
+      }
+    };
+
+    ws.onerror = function () {
+      setStatus("WebSocket error", "error");
+    };
+
+    ws.onclose = function () {
+      if (liveCheck.checked) {
+        setStatus("Disconnected — retrying in 5s…", "error");
+        setTimeout(connectWebSocket, 5000);
+      }
+    };
+  }
+
+  function closeWebSocket() {
+    if (ws) {
+      ws.onclose = null; // prevent auto-reconnect
+      ws.close();
+      ws = null;
+    }
+  }
+
+  // ── Batch fetch ───────────────────────────────────────────────────────────
+  function triggerBatchFetch() {
+    if (!backendUrl) { setStatus("No backend URL set", "error"); return; }
+    if (!currentBlock) { setStatus("No block set", "error"); return; }
+    setStatus("Scanning sheet…", "fetching");
+    google.script.run
+      .withSuccessHandler(doBatchFetch)
+      .withFailureHandler(function (e) { setStatus("Error: " + e.message, "error"); })
+      .getCellFunctions();
+  }
+
+  function doBatchFetch(cellFunctions) {
+    if (!cellFunctions || cellFunctions.length === 0) {
+      setStatus(liveCheck.checked ? "Live — no formulas" : "No formulas found", liveCheck.checked ? "live" : "");
+      // Still update pinned block so ETH_BLOCK_NUMBER() reflects current block.
+      google.script.run.writeBatchResults(currentBlock, []);
+      return;
+    }
+
+    setStatus("Fetching " + cellFunctions.length + " call(s)…", "fetching");
+
+    // Build a JSON-RPC batch request.
+    var rpcBatch = cellFunctions.map(function (cf, idx) {
+      return buildRpcCall(idx + 1, cf.fn, cf.args, currentBlock);
+    });
+
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", backendUrl, true);
+    xhr.setRequestHeader("Content-Type", "application/json");
+    xhr.onload = function () {
+      if (xhr.status !== 200) {
+        setStatus("Backend error " + xhr.status, "error");
+        return;
+      }
+      var responses;
+      try { responses = JSON.parse(xhr.responseText); } catch (e) {
+        setStatus("Invalid backend response", "error");
+        return;
+      }
+      if (!Array.isArray(responses)) responses = [responses];
+
+      // Map responses back by id.
+      var resultsById = {};
+      responses.forEach(function (r) { resultsById[r.id] = r; });
+
+      var batchResults = cellFunctions.map(function (cf, idx) {
+        var rpc = resultsById[idx + 1];
+        return {
+          fn: cf.fn,
+          args: cf.args,
+          result: (rpc && rpc.result !== undefined) ? rpc.result : null
+        };
+      });
+
+      google.script.run
+        .withSuccessHandler(function () {
+          setStatus(
+            liveCheck.checked ? "Live — block " + currentBlock : "Pinned block " + currentBlock,
+            liveCheck.checked ? "live" : "pinned"
+          );
+        })
+        .withFailureHandler(function (e) { setStatus("Write error: " + e.message, "error"); })
+        .writeBatchResults(currentBlock, batchResults);
+    };
+    xhr.onerror = function () { setStatus("Network error", "error"); };
+    xhr.send(JSON.stringify(rpcBatch));
+  }
+
+  // ── RPC builder ───────────────────────────────────────────────────────────
+  function buildRpcCall(id, fn, args, block) {
+    var blockParam = "0x" + block.toString(16);
+    switch (fn) {
+      case "ETH_BALANCE":
+        return { jsonrpc: "2.0", id: id, method: "eth_getBalance",
+                 params: [args[0], blockParam] };
+      case "ERC20_BALANCE":
+        // balanceOf(address) = 0x70a08231 + padded wallet address
+        var wallet = args[1].replace(/^0x/, "").toLowerCase().padStart(64, "0");
+        return { jsonrpc: "2.0", id: id, method: "eth_call",
+                 params: [{ to: args[0], data: "0x70a08231" + wallet }, blockParam] };
+      case "ETH_BLOCK_NUMBER":
+        return { jsonrpc: "2.0", id: id, method: "eth_blockNumber", params: [] };
+      case "ETH_CALL":
+        return { jsonrpc: "2.0", id: id, method: "eth_call",
+                 params: [{ to: args[0], data: args[1] }, blockParam] };
+      default:
+        return { jsonrpc: "2.0", id: id, method: fn, params: args };
+    }
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  function updateSlider(block) {
+    if (block > parseInt(blockSlider.max, 10)) {
+      blockSlider.max = block + 100000;
+    }
+    blockSlider.value = block;
+    blockDisplay.textContent = block;
+  }
+
+  function setStatus(msg, cls) {
+    statusBar.textContent = msg;
+    statusBar.className = cls || "";
+  }
+})();
+</script>
+</body>
+</html>
