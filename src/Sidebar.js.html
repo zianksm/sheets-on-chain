@@ -1,0 +1,251 @@
+<script>
+// =============================================================================
+// DECLARATIONS
+// =============================================================================
+
+// ── Global state ──────────────────────────────────────────────────────────────
+let backendUrl     = "";
+let ws             = null;
+let currentBlock   = 0;
+let sliderDebounce = null;
+
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+const urlInput     = document.getElementById("backendUrl");
+const urlWarning   = document.getElementById("urlWarning");
+const saveBtn      = document.getElementById("saveBtn");
+const blockSlider  = document.getElementById("blockSlider");
+const blockDisplay = document.getElementById("blockDisplay");
+const liveCheck    = document.getElementById("liveCheck");
+const statusBar    = document.getElementById("statusBar");
+
+// ── URL validation ────────────────────────────────────────────────────────────
+function isLocalhostUrl(url) {
+  return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/.test(url);
+}
+
+function validateUrl(url) {
+  const insecure = url.startsWith("http://") && !isLocalhostUrl(url);
+  urlWarning.style.display = insecure ? "block" : "none";
+}
+
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+function reconnectWebSocket() {
+  closeWebSocket();
+  connectWebSocket();
+}
+
+function connectWebSocket() {
+  if (!backendUrl) { setStatus("No backend URL set", "error"); return; }
+
+  const wsUrl = backendUrl.replace(/^http/, "ws");
+  setStatus("Connecting…", "fetching");
+
+
+  try {
+    ws = new WebSocket(wsUrl);
+  } catch (e) {
+    setStatus("WS connect failed: " + e.message, "error");
+    return;
+  }
+
+  ws.onopen = function () {
+    setStatus("Connected, subscribing…", "fetching");
+    ws.send(JSON.stringify({
+      jsonrpc: "2.0", id: 1, method: "eth_subscribe", params: ["newHeads"]
+    }));
+  };
+
+  ws.onmessage = function (evt) {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch (e) { return; }
+
+    if (msg.id === 1 && msg.result) {
+      setStatus("Live — waiting for block…", "live");
+      triggerBatchFetch();
+      return;
+    }
+
+    if (msg.method === "eth_subscription" &&
+        msg.params && msg.params.result && msg.params.result.number) {
+      currentBlock = parseInt(msg.params.result.number, 16);
+      updateSlider(currentBlock);
+      setStatus("Live — block " + currentBlock, "live");
+      triggerBatchFetch();
+    }
+  };
+
+  ws.onerror = function () {
+    const wsUrl = backendUrl.replace(/^http/, "ws");
+    if (wsUrl.startsWith("ws://") && !isLocalhostUrl(backendUrl)) {
+      setStatus("WS blocked: sidebar requires wss:// (use ngrok or a public https:// URL)", "error");
+    } else {
+      setStatus("WebSocket error — check backend is running and URL is correct", "error");
+    }
+  };
+
+  ws.onclose = function () {
+    if (liveCheck.checked) {
+      setStatus("Disconnected — retrying in 5s…", "error");
+      setTimeout(connectWebSocket, 5000);
+    }
+  };
+}
+
+function closeWebSocket() {
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+    ws = null;
+  }
+}
+
+// ── Batch fetch ───────────────────────────────────────────────────────────────
+function triggerBatchFetch() {
+  if (!backendUrl)   { setStatus("No backend URL set", "error"); return; }
+  if (!currentBlock) { setStatus("No block set", "error"); return; }
+  setStatus("Scanning sheet…", "fetching");
+  google.script.run
+    .withSuccessHandler(doBatchFetch)
+    .withFailureHandler(function (e) { setStatus("Error: " + e.message, "error"); })
+    .getCellFunctions();
+}
+
+function doBatchFetch(cellFunctions) {
+  if (!cellFunctions || cellFunctions.length === 0) {
+    setStatus(
+      liveCheck.checked ? "Live — no formulas" : "No formulas found",
+      liveCheck.checked ? "live" : ""
+    );
+    google.script.run.writeBatchResults(currentBlock, []);
+    return;
+  }
+
+  setStatus("Fetching " + cellFunctions.length + " call(s)…", "fetching");
+
+  const rpcBatch = cellFunctions.map(function (cf, idx) {
+    return buildRpcCall(idx + 1, cf.fn, cf.args, currentBlock);
+  });
+
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", backendUrl, true);
+  xhr.setRequestHeader("Content-Type", "application/json");
+
+  xhr.onload = function () {
+    if (xhr.status !== 200) { setStatus("Backend error " + xhr.status, "error"); return; }
+
+    let responses;
+    try { responses = JSON.parse(xhr.responseText); } catch (e) {
+      setStatus("Invalid backend response", "error"); return;
+    }
+    if (!Array.isArray(responses)) responses = [responses];
+
+    const resultsById = {};
+    responses.forEach(function (r) { resultsById[r.id] = r; });
+
+    const batchResults = cellFunctions.map(function (cf, idx) {
+      const rpc = resultsById[idx + 1];
+      return { fn: cf.fn, args: cf.args, cells: cf.cells, result: (rpc && rpc.result !== undefined) ? rpc.result : null };
+    });
+
+    google.script.run
+      .withSuccessHandler(function () {
+        setStatus(
+          liveCheck.checked ? "Live — block " + currentBlock : "Pinned block " + currentBlock,
+          liveCheck.checked ? "live" : "pinned"
+        );
+      })
+      .withFailureHandler(function (e) { setStatus("Write error: " + e.message, "error"); })
+      .writeBatchResults(currentBlock, batchResults);
+  };
+
+  xhr.onerror = function () { setStatus("Network error", "error"); };
+  xhr.send(JSON.stringify(rpcBatch));
+}
+
+// ── RPC builder ───────────────────────────────────────────────────────────────
+function buildRpcCall(id, fn, args, block) {
+  const blockParam = "0x" + block.toString(16);
+  switch (fn) {
+    case "ETH_BALANCE":
+      return { jsonrpc: "2.0", id, method: "eth_getBalance",
+               params: [args[0], blockParam] };
+    case "ERC20_BALANCE":
+      const wallet = args[1].replace(/^0x/, "").toLowerCase().padStart(64, "0");
+      return { jsonrpc: "2.0", id, method: "eth_call",
+               params: [{ to: args[0], data: "0x70a08231" + wallet }, blockParam] };
+    case "ETH_BLOCK_NUMBER":
+      return { jsonrpc: "2.0", id, method: "eth_blockNumber", params: [] };
+    case "ETH_CALL":
+      return { jsonrpc: "2.0", id, method: "eth_call",
+               params: [{ to: args[0], data: args[1] }, blockParam] };
+    default:
+      return { jsonrpc: "2.0", id, method: fn, params: args };
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function updateSlider(block) {
+  if (block > parseInt(blockSlider.max, 10)) blockSlider.max = block + 100000;
+  blockSlider.value        = block;
+  blockDisplay.textContent = block;
+}
+
+function setStatus(msg, cls) {
+  statusBar.textContent = msg;
+  statusBar.className   = cls || "";
+}
+
+// =============================================================================
+// MAIN — wires up event listeners and kicks off initialisation
+// =============================================================================
+
+// Disable slider until a live block arrives
+blockSlider.disabled = true;
+
+// Load saved config, then start WebSocket if live mode is on
+google.script.run
+  .withSuccessHandler(function (cfg) {
+    backendUrl     = cfg.backendUrl || "";
+    urlInput.value = backendUrl;
+    if (backendUrl) validateUrl(backendUrl);
+    if (liveCheck.checked && backendUrl) connectWebSocket();
+  })
+  .getConfig();
+
+// Validate URL as the user types
+urlInput.addEventListener("input", function () {
+  validateUrl(urlInput.value.trim());
+});
+
+// Save backend URL and reconnect
+saveBtn.addEventListener("click", function () {
+  backendUrl = urlInput.value.trim();
+  validateUrl(backendUrl);
+  google.script.run
+    .withSuccessHandler(function () {
+      setStatus("Saved", "");
+      if (liveCheck.checked && backendUrl) reconnectWebSocket();
+    })
+    .saveConfig(backendUrl);
+});
+
+// Toggle between live and pinned-block mode
+liveCheck.addEventListener("change", function () {
+  if (liveCheck.checked) {
+    blockSlider.disabled = true;
+    reconnectWebSocket();
+  } else {
+    blockSlider.disabled = false;
+    closeWebSocket();
+    setStatus("Pinned block " + currentBlock, "pinned");
+  }
+});
+
+// Debounced fetch when slider is moved manually
+blockSlider.addEventListener("input", function () {
+  currentBlock = parseInt(blockSlider.value, 10);
+  blockDisplay.textContent = currentBlock;
+  clearTimeout(sliderDebounce);
+  sliderDebounce = setTimeout(triggerBatchFetch, 300);
+});
+</script>

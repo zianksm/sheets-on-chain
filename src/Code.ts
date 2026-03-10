@@ -9,15 +9,23 @@ interface BatchCallRequest {
   args: string[];
 }
 
+interface CellEntry {
+  row: number;
+  col: number;
+  formula: string;
+}
+
 interface BatchCallResult {
   fn: string;
   args: string[];
   result: unknown;
+  cells: CellEntry[];
 }
 
 interface CellFunction {
   fn: string;
   args: string[];
+  cells: CellEntry[];
 }
 
 // --------------- Lifecycle ---------------
@@ -36,10 +44,15 @@ function onHomepage(): void {
 }
 
 function openSidebar(): void {
-  const html = HtmlService.createHtmlOutputFromFile("Sidebar")
+  const html = HtmlService.createTemplateFromFile("Sidebar")
+    .evaluate()
     .setTitle("sheets-on-chain")
     .setWidth(320);
   SpreadsheetApp.getUi().showSidebar(html);
+}
+
+function include(filename: string): string {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
 }
 
 // --------------- Config ---------------
@@ -106,6 +119,8 @@ function getCellFunctions(): CellFunction[] {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
   const range = sheet.getDataRange();
   const formulas = range.getFormulas();
+  const startRow = range.getRow();
+  const startCol = range.getColumn();
 
   // Pattern: =FNNAME( ... ) — captures the argument string inside the parens.
   const fnPattern = new RegExp(
@@ -113,22 +128,22 @@ function getCellFunctions(): CellFunction[] {
     "gi"
   );
 
-  const seen = new Set<string>();
-  const results: CellFunction[] = [];
+  const seen = new Map<string, CellFunction>();
 
-  for (const row of formulas) {
-    for (const cell of row) {
+  for (let r = 0; r < formulas.length; r++) {
+    for (let c = 0; c < formulas[r].length; c++) {
+      const cell = formulas[r][c];
       if (!cell) continue;
       let match: RegExpExecArray | null;
       while ((match = fnPattern.exec(cell)) !== null) {
         const fn = match[1].toUpperCase();
-        // Parse the argument string into individual args.
-        const rawArgs = match[2];
-        const args = parseArgList(rawArgs);
+        const args = parseArgList(match[2]);
         const key = `${fn}:${args.join(",")}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          results.push({ fn, args });
+        const entry: CellEntry = { row: r + startRow, col: c + startCol, formula: cell };
+        if (seen.has(key)) {
+          seen.get(key)!.cells.push(entry);
+        } else {
+          seen.set(key, { fn, args, cells: [entry] });
         }
       }
       // Reset lastIndex since we're reusing the same regex object.
@@ -136,7 +151,7 @@ function getCellFunctions(): CellFunction[] {
     }
   }
 
-  return results;
+  return Array.from(seen.values());
 }
 
 /**
@@ -165,13 +180,28 @@ function writeBatchResults(
   const CACHE_TTL = 3600; // seconds — 1 hour
 
   const entries: { [key: string]: string } = {};
+  const changed: BatchCallResult[] = [];
   for (const r of results) {
     const key = makeCacheKey(r.fn, r.args, block);
-    entries[key] = JSON.stringify(r.result);
+    const newVal = JSON.stringify(r.result);
+    if (cache.get(key) !== newVal) changed.push(r);
+    entries[key] = newVal;
   }
   cache.putAll(entries, CACHE_TTL);
 
   setPinnedBlock(block);
+
+  // Re-apply the formula on cells whose result changed — this forces
+  // Google Sheets to re-execute the custom function and pick up the new
+  // cached value without the user having to change the formula.
+  if (changed.length > 0) {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+    for (const r of changed) {
+      for (const cell of r.cells) {
+        sheet.getRange(cell.row, cell.col).setFormula(cell.formula);
+      }
+    }
+  }
 }
 
 function makeCacheKey(fn: string, args: string[], block: number): string {

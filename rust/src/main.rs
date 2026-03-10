@@ -18,8 +18,10 @@ use jsonrpsee::server::{RpcModule, Server, SubscriptionMessage};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::Value;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info, warn};
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
@@ -75,7 +77,15 @@ async fn main() -> Result<()> {
     });
 
     // Build and start the jsonrpsee server.
-    let server = Server::builder().build(args.listen).await?;
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+    let middleware = tower::ServiceBuilder::new().layer(cors);
+    let server = Server::builder()
+        .set_http_middleware(middleware)
+        .build(args.listen)
+        .await?;
     let module = build_rpc_module(state);
     let handle = server.start(module);
     info!("Server started");
@@ -100,7 +110,15 @@ fn build_rpc_module(state: Arc<AppState>) -> RpcModule<Arc<AppState>> {
             let (address, block): (String, String) = params.parse()?;
             proxy_call(&ctx.upstream_http, "eth_getBalance", serde_json::json!([address, block]))
                 .await
-                .map_err(rpc_err)
+                .map_err(rpc_err).map(|a|{
+                    let literal = a.to_string().replace("\"", "");
+                    info!("{literal}");
+                    let literal = alloy::primitives::U256::from_str(&literal).unwrap().to_string();
+                info!("{literal}");
+
+
+                        Value::from(literal)
+                })  
         })
         .unwrap();
 

@@ -3,9 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "packageManager": "pnpm@10.6.2",
+  "scripts": {
+    "dev": "bash scripts/dev.sh"
+  },
   "dependencies": {
     "@google/clasp": "^2.4.2",
     "@types/google-apps-script": "^1.0.83",
+    "concurrently": "^9.0.0",
     "typescript": "^5.4.0"
   }
 }
